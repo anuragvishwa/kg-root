@@ -1,0 +1,12 @@
+{
+  "$id": "https://kgroot.dev/Event",
+  "type": "object",
+  "required": ["source", "service", "event_type", "ts", "attributes"],
+  "properties": {
+    "source": { "enum": ["github", "sentry", "k8s", "prom", "loki"] },
+    "service": { "type": "string" },
+    "event_type": { "type": "string" },
+    "ts": { "type": "string", "format": "date-time" },
+    "attributes": { "type": "object" }
+  }
+}

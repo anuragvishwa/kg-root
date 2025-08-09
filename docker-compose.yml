@@ -1,0 +1,167 @@
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_import:
+  neo4j_plugins:
+
+networks:
+  default:
+    name: kgroot-demo
+
+services:
+  # 1) Zookeeper
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+    networks:
+      - default
+
+  # 2) Kafka (single broker)
+  kafka:
+    image: bitnami/kafka:3
+    depends_on:
+      - zookeeper
+    environment:
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_BROKER_ID: "1"
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:19092"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:19092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+      - "19092:19092"
+    networks:
+      - default
+
+  # 3) Neo4j 5 with GDS + APOC
+  neo4j:
+    image: neo4j:5.26
+    hostname: neo4j
+    depends_on:
+      - kafka
+    environment:
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD}"
+      NEO4J_PLUGINS: '["graph-data-science","apoc"]'
+      NEO4J_db_tx__log_rotation_retention__policy: "false"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*"
+    ports:
+      - "7687:7687"
+      - "7474:7474"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/import
+      - neo4j_plugins:/plugins
+    networks:
+      - default
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cypher-shell -a bolt://localhost:7687 -u neo4j -p '${NEO4J_PASSWORD}' 'RETURN 1' || exit 1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 40s
+
+  # 4) Graph-updater
+  graph-updater:
+    build: .
+    command: >
+      sh -c "
+        python services/_wait_kafka.py kafka 9092 &&
+        python services/graph_updater.py
+      "
+    depends_on:
+      kafka:
+        condition: service_started
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - ./services:/app/services:ro # << use your local code
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+
+  # 5) GCN matcher (FastAPI)
+  gcn-matcher:
+    build: .
+    command: uvicorn services.gcn_matcher:app --host 0.0.0.0 --port 8000
+    depends_on:
+      - neo4j
+    ports:
+      - "8000:8000"
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+    networks:
+      - default
+
+  # 6) FEKG builder
+  fekg-builder:
+    build: .
+    depends_on:
+      - kafka
+      - neo4j
+    command: >
+      sh -c "
+        python services/_wait_kafka.py kafka 9092 &&
+        python services/fekg_builder.py
+      "
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+    networks:
+      - default
+
+  # 7) Agno-RCCA agent
+  agno-rcca:
+    build: .
+    depends_on:
+      - kafka
+      - neo4j
+      - graph-updater
+      - gcn-matcher
+    command: >
+      sh -c "
+        python services/_wait_kafka.py kafka 9092 &&
+        python services/agno_rcca.py
+      "
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+    networks:
+      - default
+
+  # 8) Connectors (Node + Python)
+  connectors:
+    build: .
+    depends_on:
+      - kafka
+    command: >
+      sh -c "
+        python services/_wait_kafka.py kafka 9092 &&
+        npm run start:connectors
+      "
+    environment:
+      OPENAI_API_KEY: "${OPENAI_API_KEY}"
+      KAFKA_BOOTSTRAP: "kafka:9092"
+    networks:
+      - default
