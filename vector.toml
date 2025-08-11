@@ -1,0 +1,264 @@
+# =======================
+# GLOBAL
+# =======================
+data_dir = "/tmp/vector-data"
+
+# =======================
+# SOURCES
+# =======================
+[sources.webhooks]
+type     = "http_server"
+address  = "0.0.0.0:8080"
+encoding = "json"
+
+# =======================
+# TRANSFORMS
+# =======================
+
+# 1) Route based on headers/body
+[transforms.route_kind]
+type   = "route"
+inputs = ["webhooks"]
+
+[transforms.route_kind.route]
+github   = 'exists(.headers."X-GitHub-Event") || exists(.github)'
+sentry   = 'exists(.headers."sentry-hook-resource") || exists(.sentry)'
+supabase = 'exists(.supabase) || exists(.headers."x-supabase-signature") || exists(.headers."x-client-info")'
+# others go to route_kind._unmatched
+
+# -------- GitHub normalizer --------
+[transforms.gh_norm]
+type   = "remap"
+inputs = ["route_kind.github"]
+source = '''
+.kind = "github"
+
+# timestamp -> unix seconds (nest blocks; avoid else-if at BOL)
+ts = null
+if is_integer(.timestamp) {
+  ts = .timestamp
+} else {
+  if is_timestamp(.timestamp) {
+    ts2, err = to_unix_timestamp(.timestamp)
+    if err == null { ts = ts2 } else { ts = to_unix_timestamp(now()) }
+  } else {
+    if is_string(.timestamp) {
+      t, pe = parse_timestamp(.timestamp, format: "%+")
+      if pe == null { ts = to_unix_timestamp(t) } else { ts = to_unix_timestamp(now()) }
+    } else {
+      ts = to_unix_timestamp(now())
+    }
+  }
+}
+.timestamp = ts
+
+# service
+svc = .repository.full_name
+if svc == null { svc = .repo.full_name }
+if svc == null { svc = .organization.login }
+if svc == null { svc = "github" }
+.service = to_string(svc) ?? "github"
+
+# event_type
+ev = .headers."X-GitHub-Event"
+if ev == null { ev = .event }
+if ev == null { ev = .github.event }
+ev = to_string(ev) ?? "event"
+ev = downcase(ev)
+ac = to_string(.action) ?? to_string(.payload.action) ?? ""
+ac = downcase(ac)
+if ac == "" { .event_type = "github." + ev } else { .event_type = "github." + ev + "." + ac }
+
+# attributes
+.attributes.headers    = .headers
+.attributes.repository = .repository
+.attributes.payload    = .payload
+'''
+
+# -------- Sentry normalizer --------
+[transforms.sentry_norm]
+type   = "remap"
+inputs = ["route_kind.sentry"]
+source = '''
+.kind = "sentry"
+
+# timestamp
+ts = null
+if is_integer(.timestamp) {
+  ts = .timestamp
+} else {
+  if is_timestamp(.timestamp) {
+    ts2, err = to_unix_timestamp(.timestamp)
+    if err == null { ts = ts2 } else { ts = to_unix_timestamp(now()) }
+  } else {
+    if is_string(.timestamp) {
+      t, pe = parse_timestamp(.timestamp, format: "%+")
+      if pe == null { ts = to_unix_timestamp(t) } else { ts = to_unix_timestamp(now()) }
+    } else {
+      ts = to_unix_timestamp(now())
+    }
+  }
+}
+.timestamp = ts
+
+# service
+svc = .project_slug
+if svc == null { svc = .project }
+if svc == null { svc = .sentry.project }
+if svc == null { svc = "sentry" }
+.service = to_string(svc) ?? "sentry"
+
+# event_type (prefer http.* when 4xx/5xx)
+res = to_string(.headers."sentry-hook-resource") ?? to_string(.sentry.resource) ?? "event"
+res = downcase(res)
+typ = to_string(.headers."sentry-hook-event") ?? to_string(.sentry.event) ?? ""
+typ = downcase(typ)
+
+# safe status extraction
+status = null
+s1, e1 = to_int(.data.event.contexts.response.status_code)
+if e1 == null { status = s1 }
+if status == null {
+  s2, e2 = to_int(.http.status_code)
+  if e2 == null { status = s2 }
+}
+
+# only compare after coercion to int
+if is_integer(status) {
+  code = to_int(status)
+  if code >= 400 {
+    if code < 600 {
+      .event_type = "http." + to_string(code)
+    } else {
+      if typ == "" { .event_type = "sentry." + res } else { .event_type = "sentry." + res + "." + typ }
+    }
+  } else {
+    if typ == "" { .event_type = "sentry." + res } else { .event_type = "sentry." + res + "." + typ }
+  }
+} else {
+  if typ == "" { .event_type = "sentry." + res } else { .event_type = "sentry." + res + "." + typ }
+}
+
+# attributes
+.attributes.data          = .data
+.attributes.organization  = .organization
+.attributes.url           = .url
+'''
+
+# -------- Supabase normalizer --------
+[transforms.supabase_norm]
+type   = "remap"
+inputs = ["route_kind.supabase"]
+source = '''
+.kind = "supabase"
+
+# timestamp
+ts = null
+if is_integer(.timestamp) {
+  ts = .timestamp
+} else {
+  if is_timestamp(.timestamp) {
+    ts2, err = to_unix_timestamp(.timestamp)
+    if err == null { ts = ts2 } else { ts = to_unix_timestamp(now()) }
+  } else {
+    if is_string(.timestamp) {
+      t, pe = parse_timestamp(.timestamp, format: "%+")
+      if pe == null { ts = to_unix_timestamp(t) } else { ts = to_unix_timestamp(now()) }
+    } else {
+      ts = to_unix_timestamp(now())
+    }
+  }
+}
+.timestamp = ts
+
+# service
+svc = .supabase.project_ref
+if svc == null { svc = .project }
+if svc == null { svc = "supabase" }
+.service = to_string(svc) ?? "supabase"
+
+# event_type (with http override if 4xx/5xx)
+typ = to_string(.supabase.type) ?? to_string(.type) ?? "event"
+typ = downcase(typ)
+sub = to_string(.supabase.subtype) ?? to_string(.subtype) ?? ""
+sub = downcase(sub)
+if sub == "" { .event_type = "supabase." + typ } else { .event_type = "supabase." + typ + "." + sub }
+
+st, es = to_int(.http.status_code)
+if es == null {
+  code = to_int(st)
+  if code >= 400 {
+    if code < 600 {
+      .event_type = "http." + to_string(code)
+    }
+  }
+}
+
+# attributes
+.attributes.supabase = .supabase
+.attributes.table    = .table
+.attributes.record   = .record
+.attributes.schema   = .schema
+.attributes.user     = .user
+.attributes.http     = .http
+'''
+
+# -------- Other / unmatched --------
+[transforms.other_norm]
+type   = "remap"
+inputs = ["route_kind._unmatched"]
+source = '''
+.kind = "other"
+
+# timestamp
+ts = null
+if is_integer(.timestamp) {
+  ts = .timestamp
+} else {
+  if is_timestamp(.timestamp) {
+    ts2, err = to_unix_timestamp(.timestamp)
+    if err == null { ts = ts2 } else { ts = to_unix_timestamp(now()) }
+  } else {
+    if is_string(.timestamp) {
+      t, pe = parse_timestamp(.timestamp, format: "%+")
+      if pe == null { ts = to_unix_timestamp(t) } else { ts = to_unix_timestamp(now()) }
+    } else {
+      ts = to_unix_timestamp(now())
+    }
+  }
+}
+.timestamp = ts
+
+.service    = to_string(.service) ?? "UNKNOWN"
+.event_type = to_string(.event_type) ?? "log.other"
+
+if !exists(.attributes) { .attributes = {} }
+if exists(.message) {
+  m, em = to_string(.message)
+  if em == null { .attributes.message = slice!(m, 0, 500) }
+}
+'''
+
+# -------- Final unify --------
+[transforms.norm_final]
+type   = "remap"
+inputs = ["gh_norm", "sentry_norm", "supabase_norm", "other_norm"]
+source = '''
+.service    = to_string(.service) ?? "UNKNOWN"
+.event_type = to_string(.event_type) ?? "log.other"
+if !exists(.attributes) { .attributes = {} }
+if !exists(.fault_id)  { .fault_id = null }
+'''
+
+# =======================
+# SINK
+# =======================
+[sinks.kafka_out]
+type              = "kafka"
+inputs            = ["norm_final"]
+bootstrap_servers = "${KAFKA_BOOTSTRAP:-kafka:9092}"
+topic             = "${EVENT_TOPIC:-events}"
+encoding.codec    = "json"
+
+[sinks.kafka_out.healthcheck]
+enabled = false

@@ -6,7 +6,9 @@ agno>=1.1.6
 fastapi
 uvicorn[standard]
 networkx
-torch
-torch-geometric
 pydantic
 aiokafka
+joblib>=1.4.0
+scikit-learn
+gensim
+sentence-transformers

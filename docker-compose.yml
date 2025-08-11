@@ -9,40 +9,65 @@ networks:
     name: kgroot-demo
 
 services:
-  # 1) Zookeeper
+  # 1) Zookeeper (ARM64-safe tag)
   zookeeper:
-    image: bitnami/zookeeper:3.9
+    image: bitnami/zookeeper:3.9.3-debian-12-r21
     environment:
       ALLOW_ANONYMOUS_LOGIN: "yes"
-    networks:
-      - default
+      # If you WANT 4-letter commands later, uncomment:
+      # ZOO_4LW_COMMANDS_WHITELIST: "ruok,stat,mntr"
+    restart: unless-stopped
+    networks: [default]
+    healthcheck:
+      # Simple TCP check (no nc, no 4lw needed)
+      test: ["CMD", "bash", "-lc", "exec 3<>/dev/tcp/127.0.0.1/2181"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
 
-  # 2) Kafka (single broker)
+  # 2) Kafka (single broker; ARM64-safe tag)
   kafka:
-    image: bitnami/kafka:3
+    image: bitnami/kafka:3.9.0-debian-12-r13
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     environment:
       ALLOW_PLAINTEXT_LISTENER: "yes"
       KAFKA_BROKER_ID: "1"
       KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      # listeners: internal (for containers) + host (for your Mac)
       KAFKA_CFG_LISTENERS: "PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:19092"
       KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:19092"
       KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
       KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
       KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
     ports:
-      - "9092:9092"
-      - "19092:19092"
-    networks:
-      - default
+      - "9092:9092" # containers -> kafka:9092
+      - "19092:19092" # host -> localhost:19092
+    restart: unless-stopped
+    networks: [default]
+    healthcheck:
+      # Wait until broker is actually serving requests
+      test:
+        [
+          "CMD",
+          "bash",
+          "-lc",
+          "/opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 4s
+      retries: 50
+      start_period: 60s
 
   # 3) Neo4j 5 with GDS + APOC
   neo4j:
     image: neo4j:5.26
     hostname: neo4j
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     environment:
       NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD}"
       NEO4J_PLUGINS: '["graph-data-science","apoc"]'
@@ -56,8 +81,8 @@ services:
       - neo4j_logs:/logs
       - neo4j_import:/import
       - neo4j_plugins:/plugins
-    networks:
-      - default
+    restart: unless-stopped
+    networks: [default]
     healthcheck:
       test:
         [
@@ -79,24 +104,27 @@ services:
       "
     depends_on:
       kafka:
-        condition: service_started
+        condition: service_healthy
       neo4j:
         condition: service_healthy
     volumes:
-      - ./services:/app/services:ro # << use your local code
+      - ./services:/app/services:ro
     environment:
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
       NEO4J_URI: "bolt://neo4j:7687"
       NEO4J_USER: "neo4j"
       NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
       KAFKA_BOOTSTRAP: "kafka:9092"
+    restart: unless-stopped
+    networks: [default]
 
   # 5) GCN matcher (FastAPI)
   gcn-matcher:
     build: .
     command: uvicorn services.gcn_matcher:app --host 0.0.0.0 --port 8000
     depends_on:
-      - neo4j
+      neo4j:
+        condition: service_healthy
     ports:
       - "8000:8000"
     environment:
@@ -105,15 +133,17 @@ services:
       NEO4J_USER: "neo4j"
       NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
       KAFKA_BOOTSTRAP: "kafka:9092"
-    networks:
-      - default
+    restart: unless-stopped
+    networks: [default]
 
   # 6) FEKG builder
   fekg-builder:
     build: .
     depends_on:
-      - kafka
-      - neo4j
+      kafka:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
     command: >
       sh -c "
         python services/_wait_kafka.py kafka 9092 &&
@@ -125,17 +155,21 @@ services:
       NEO4J_USER: "neo4j"
       NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
       KAFKA_BOOTSTRAP: "kafka:9092"
-    networks:
-      - default
+    restart: unless-stopped
+    networks: [default]
 
   # 7) Agno-RCCA agent
   agno-rcca:
     build: .
     depends_on:
-      - kafka
-      - neo4j
-      - graph-updater
-      - gcn-matcher
+      kafka:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      graph-updater:
+        condition: service_started
+      gcn-matcher:
+        condition: service_started
     command: >
       sh -c "
         python services/_wait_kafka.py kafka 9092 &&
@@ -147,14 +181,15 @@ services:
       NEO4J_USER: "neo4j"
       NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
       KAFKA_BOOTSTRAP: "kafka:9092"
-    networks:
-      - default
+    restart: unless-stopped
+    networks: [default]
 
   # 8) Connectors (Node + Python)
   connectors:
     build: .
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     command: >
       sh -c "
         python services/_wait_kafka.py kafka 9092 &&
@@ -163,5 +198,22 @@ services:
     environment:
       OPENAI_API_KEY: "${OPENAI_API_KEY}"
       KAFKA_BOOTSTRAP: "kafka:9092"
-    networks:
-      - default
+    restart: unless-stopped
+    networks: [default]
+
+  # 9) Vector (webhook → Kafka)
+  vector:
+    image: timberio/vector:0.48.0-debian
+    command: ["-c", "/etc/vector/vector.toml"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      EVENT_TOPIC: events
+    volumes:
+      - ./vector.toml:/etc/vector/vector.toml:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    networks: [default]

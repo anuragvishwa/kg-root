@@ -15,8 +15,14 @@ COPY connectors ./connectors
 RUN npm install --silent
 
 # ── Python deps ───────────────────────────────────────────
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install base deps first
+COPY requirements.base.txt .
+RUN pip install --no-cache-dir -r requirements.base.txt
+
+# Install PyTorch + PyG deps next
+COPY requirements.torch.txt .
+RUN pip install --no-cache-dir -r requirements.torch.txt
+
 
 # ── Copy rest of code ─────────────────────────────────────
 COPY . .
